@@ -1,11 +1,11 @@
 # masterthesis-MUCSS-PRM
 R code and report for my Master’s Thesis, *Fraud detection performance and interpretability: controlled simulation of statistical and Machine Learning models*, with fully reproducible pipelines. Simulates linear and non-linear insurance data, trains Logistic Regression, Random Forest, XGBoost, and SVM via tidymodels, calibrates thresholds, evaluates with AUC and PR-AUC, and adds SHAP (fastshap) and DALEX for global and local explanations.
 
-**Word file:** The Word file XXX contains the master's thesis itself, with all the necessary information in terms of requirements. Reading this file will help you understand the procedures carried out in the Rmd and html file.
+**Word file:** The Word file 20250831_tfm_Pablo_Romero.docx contains the master's thesis itself, with all the necessary information in terms of requirements. Reading this file will help you understand the procedures carried out in the Rmd and html file.
 
 **Reproducibility**
-	•	**Single code source:** masterthesis_MUCSS_PRM.Rmd is self-contained and sets seeds.
-	•	**Output code:** masterthesis_MUCSS_PRM.html.
+	•	**Single code source:** 20250831_tfm_Pablo_Romero.Rmd is self-contained and sets seeds.
+	•	**Output code:** 20250831_tfm_Pablo_Romero.html.
 	•	Execution is compute-heavy by design (tuning, SHAP, DALEX, etc.). It runs long but is correct.
 
  **Requirements**
