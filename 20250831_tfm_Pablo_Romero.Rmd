@@ -1,0 +1,673 @@
+---
+title: "Fraud detection performance and interpretability: controlled simulation of statistical and Machine Learning models"
+author: "Pablo Romero Medinilla"
+date: "Last compiled on `r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Setup and Libraries
+
+```{r, warning=FALSE, message=FALSE}
+
+# List of required packages
+required_packages <- c(
+  "tidymodels", "dplyr", "ggplot2", "stringr", "purrr", "tibble", "tidyr",
+  "dials", "finetune", "fastshap", "lime", "yardstick", "recipes", "stats",
+  "tibble", "DALEX", "knitr"
+)
+
+# Check which packages are not installed
+missing_packages <- required_packages[!(required_packages %in%
+                                          installed.packages()[, "Package"])]
+
+# Install missing packages
+if (length(missing_packages) > 0) {
+  options(repos = c(CRAN = "https://cloud.r-project.org/")) # Set a CRAN mirror
+  install.packages(missing_packages)
+}
+
+# Load the packages
+invisible(lapply(required_packages, library, character.only = TRUE))
+
+```
+
+# Synthetic Data Generators
+
+```{r}
+
+generate_linear_data <- function(n = 10000, seed = 1) {
+  set.seed(seed)
+  age <- pmin(pmax(round(rnorm(n, 42, 12)), 18), 90)
+  ageveh <- pmin(pmax(round(rnorm(n, 7, 4)), 0), 25)
+  drivexp <- pmin(pmax(round(rnorm(n, 15, 8)), 0), pmax(age - 18, 0))
+  pkmurb <- round(100 * rbeta(n, 5, 3))
+  pkmnig <- round(100 * rbeta(n, 2, 12))
+  pkmexc <- round(100 * rbeta(n, 1.5, 18))
+  kmtotal <- round(rlnorm(n, meanlog = log(12000), sdlog = 0.5))
+  nclaims_prev <- pmin(rpois(n, 0.3), 6)
+  car_power <- pmin(pmax(round(rnorm(n, 120, 35)), 55), 300)
+  premium_annual <- round(150 + 0.006 * kmtotal + 0.8 * nclaims_prev +
+                            0.4 * pkmexc + 0.2 * (car_power - 120) + rnorm(n, 0, 50))
+  premium_annual[premium_annual < 80] <- 80
+
+  gender <- sample(c("male","female"), n, TRUE)
+  claim_type <- sample(c("collision","theft","fire","other"), n, TRUE, prob = c(0.5,0.2,0.1,0.2))
+
+  predictors <- data.frame(
+    age, ageveh, drivexp, pkmurb, pkmnig, pkmexc,
+    kmtotal, nclaims_prev, car_power, premium_annual
+  )
+
+  x_std <- scale(predictors)
+  betas <- runif(ncol(predictors), -2, 2)
+  epsilon <- rnorm(n)
+  y_latent <- as.numeric(x_std %*% betas) + epsilon
+  prob <- plogis(y_latent)
+  y <- rbinom(n, 1, pmin(pmax(prob * 0.2, 0), 1))
+
+  dplyr::bind_cols(
+    predictors,
+    gender = gender,
+    claim_type = claim_type,
+    y = factor(y, levels = c(0,1), labels = c("no_fraud","fraud"))
+  )
+}
+
+generate_nonlinear_data <- function(n = 10000, seed = 1) {
+  set.seed(seed)
+  age <- pmin(pmax(round(rnorm(n, 42, 12)), 18), 90)
+  ageveh <- pmin(pmax(round(rnorm(n, 7, 4)), 0), 25)
+  drivexp <- pmin(pmax(round(rnorm(n, 15, 8)), 0), pmax(age - 18, 0))
+  pkmurb <- round(100 * rbeta(n, 5, 3))
+  pkmnig <- round(100 * rbeta(n, 2, 12))
+  pkmexc <- round(100 * rbeta(n, 1.5, 18))
+  kmtotal <- round(rlnorm(n, meanlog = log(12000), sdlog = 0.5))
+  nclaims_prev <- pmin(rpois(n, 0.3), 6)
+  car_power <- pmin(pmax(round(rnorm(n, 120, 35)), 55), 300)
+  premium_annual <- round(150 + 0.006 * kmtotal + 0.8 * nclaims_prev +
+                            0.4 * pkmexc + 0.2 * (car_power - 120) + rnorm(n, 0, 50))
+  premium_annual[premium_annual < 80] <- 80
+
+  gender <- sample(c("male","female"), n, TRUE)
+  claim_type <- sample(c("collision","theft","fire","other"), n, TRUE, prob = c(0.5,0.2,0.1,0.2))
+
+  telem_score <- round(100 * rbeta(n, 2.5, 4.5))
+
+  predictors <- data.frame(
+    age, ageveh, drivexp, pkmurb, pkmnig, pkmexc,
+    kmtotal, nclaims_prev, car_power, premium_annual,
+    telem_score
+  )
+
+  x_std <- scale(predictors)
+  betas <- runif(ncol(predictors), -2, 2)
+  epsilon <- rnorm(n)
+
+  nonlinear_term <-
+    1.2 * sin(pi * (pkmnig / 100)) +
+    0.6 * log1p(kmtotal) / 10 +
+    0.8 * (pkmexc / 100)^2 -
+    0.7 * as.numeric(ageveh > 10) +
+    0.5 * (car_power / 300) * (pkmexc / 100) +
+    1.0 * sin(pi * (telem_score / 100))
+
+  y_latent <- as.numeric(x_std %*% betas) + nonlinear_term + epsilon
+  prob <- plogis(y_latent)
+  y <- rbinom(n, 1, pmin(pmax(prob * 0.2, 0), 1))
+
+  dplyr::bind_cols(
+    predictors,
+    gender = gender,
+    claim_type = claim_type,
+    y = factor(y, levels = c(0,1), labels = c("no_fraud","fraud"))
+  )
+}
+
+```
+
+```{r}
+
+# Datasets simulation
+linear_df    <- generate_linear_data(n = 10000, seed = 1)
+nonlinear_df <- generate_nonlinear_data(n = 10000, seed = 1)
+
+# Balance check
+linear_df  |> count(y)  |> mutate(prop = n / sum(n))
+nonlinear_df |> count(y) |> mutate(prop = n / sum(n))
+
+# Train/Test + calibration (umbrals)
+set.seed(3)
+lin_split <- initial_split(linear_df, prop = 0.8, strata = y)
+linear_train <- training(lin_split)
+linear_test  <- testing(lin_split)
+
+nl_split <- initial_split(nonlinear_df, prop = 0.8, strata = y)
+nonlinear_train <- training(nl_split)
+nonlinear_test  <- testing(nl_split)
+
+```
+
+# Preprocessing recipes
+
+```{r}
+
+rec_log <- recipe(y ~ ., data = linear_train) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_normalize(all_numeric_predictors())
+
+rec_rf  <- rec_log
+rec_xgb <- rec_log
+rec_svm <- rec_log
+
+rec_log_nl <- recipe(y ~ ., data = nonlinear_train) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_normalize(all_numeric_predictors())
+
+rec_rf_nl  <- rec_log_nl
+rec_xgb_nl <- rec_log_nl
+rec_svm_nl <- rec_log_nl
+
+```
+
+# Model Specifications
+
+```{r}
+
+log_reg_spec <- logistic_reg() |>
+  set_engine("glm") |>
+  set_mode("classification")
+
+rf_spec <- rand_forest(
+  mtry  = tune(), 
+  trees = tune(), 
+  min_n = tune()
+) |>
+  set_engine("ranger", importance = "impurity") |>
+  set_mode("classification")
+
+xgb_spec <- boost_tree(
+  mtry          = tune(),
+  trees         = tune(),
+  min_n         = tune(),
+  tree_depth    = tune(),
+  learn_rate    = tune(),
+  loss_reduction= tune(),
+  sample_size   = tune()
+) |>
+  set_engine("xgboost") |>
+  set_mode("classification")
+
+svm_spec <- svm_rbf(
+  cost      = tune(),
+  rbf_sigma = tune()
+) |>
+  set_engine("kernlab") |>
+  set_mode("classification")
+
+wf <- function(spec, rec) {
+  workflow() |> add_model(spec) |> add_recipe(rec)
+}
+
+```
+
+# Hyperparameters Grids and Cross-Validation
+
+```{r}
+
+set.seed(4)
+folds_lin <- vfold_cv(linear_train, v = 4, strata = y)
+folds_nl  <- vfold_cv(nonlinear_train, v = 4, strata = y)
+
+# Calculate how many predictors remain after preprocessing and set the mtry range
+lin_baked <- bake(prep(rec_log), new_data = linear_train) |> select(-y)
+nl_baked  <- bake(prep(rec_log_nl), new_data = nonlinear_train) |> select(-y)
+
+# RF
+rf_grid <- grid_space_filling(
+  finalize(mtry(), lin_baked),
+  trees(),
+  min_n(),
+  size = 20
+)
+
+# XGB
+xgb_grid <- grid_space_filling(
+  trees(), tree_depth(), learn_rate(), loss_reduction(),
+  sample_prop(), finalize(mtry(), lin_baked), min_n(),
+  size = 20
+)
+
+# SVM
+svm_grid <- grid_space_filling(
+  cost(), rbf_sigma(),
+  size = 20
+)
+
+# Tune metrics
+tune_metrics <- metric_set(roc_auc, pr_auc, accuracy, f_meas, recall, precision)
+
+```
+
+## Hyperparameter Tuning - Linear Dataset
+
+```{r, warning=FALSE}
+
+# Logistic (without tuning)
+logit_lin_fit <- fit(wf(log_reg_spec, rec_log), data = linear_train)
+
+# RF
+set.seed(5)
+rf_lin_tuned <- tune_grid(
+  wf(rf_spec, rec_rf),
+  resamples = folds_lin,
+  grid = rf_grid,
+  metrics = tune_metrics
+)
+rf_lin_best  <- select_best(rf_lin_tuned, metric = "pr_auc")
+rf_lin_final <- finalize_workflow(wf(rf_spec, rec_rf), rf_lin_best) |>
+  fit(linear_train)
+
+# XGB
+set.seed(6)
+xgb_lin_tuned <- tune_grid(
+  wf(xgb_spec, rec_xgb),
+  resamples = folds_lin,
+  grid = xgb_grid,
+  metrics = tune_metrics
+)
+xgb_lin_best  <- select_best(xgb_lin_tuned, metric = "pr_auc")
+xgb_lin_final <- finalize_workflow(wf(xgb_spec, rec_xgb), xgb_lin_best) |>
+  fit(linear_train)
+
+# SVM
+set.seed(7)
+svm_lin_tuned <- tune_grid(
+  wf(svm_spec, rec_svm),
+  resamples = folds_lin,
+  grid = svm_grid,
+  metrics = tune_metrics
+)
+svm_lin_best  <- select_best(svm_lin_tuned, metric = "pr_auc")
+svm_lin_final <- finalize_workflow(wf(svm_spec, rec_svm), svm_lin_best) |>
+  fit(linear_train)
+
+```
+
+## Hyperparameter Tuning - Non-Linear Dataset
+
+```{r, warning=FALSE}
+
+# Logistic (without tuning)
+logit_nl_fit <- fit(wf(log_reg_spec, rec_log_nl), data = nonlinear_train)
+
+# RF
+set.seed(8)
+rf_nl_tuned <- tune_grid(
+  wf(rf_spec, rec_rf_nl),
+  resamples = folds_nl,
+  grid = rf_grid,
+  metrics = tune_metrics
+)
+rf_nl_best  <- select_best(rf_nl_tuned, metric = "pr_auc")
+rf_nl_final <- finalize_workflow(wf(rf_spec, rec_rf_nl), rf_nl_best) |>
+  fit(nonlinear_train)
+
+# XGB
+set.seed(9)
+xgb_nl_tuned <- tune_grid(
+  wf(xgb_spec, rec_xgb_nl),
+  resamples = folds_nl,
+  grid = xgb_grid,
+  metrics = tune_metrics
+)
+xgb_nl_best  <- select_best(xgb_nl_tuned, metric = "pr_auc")
+xgb_nl_final <- finalize_workflow(wf(xgb_spec, rec_xgb_nl), xgb_nl_best) |>
+  fit(nonlinear_train)
+
+# SVM
+set.seed(10)
+svm_nl_tuned <- tune_grid(
+  wf(svm_spec, rec_svm_nl),
+  resamples = folds_nl,
+  grid = svm_grid,
+  metrics = tune_metrics
+)
+svm_nl_best  <- select_best(svm_nl_tuned, metric = "pr_auc")
+svm_nl_final <- finalize_workflow(wf(svm_spec, rec_svm_nl), svm_nl_best) |>
+  fit(nonlinear_train)
+
+```
+
+# Engine + Recipe Probability Extraction and F1-Optimized Thresholding
+
+```{r}
+
+# Engine test predictions + recipe
+get_prob_df_engine <- function(fit_engine, recipe_obj, new_data, outcome = "y") {
+  processed <- bake(prep(recipe_obj, retain = TRUE), new_data = new_data)
+  tibble(
+    !!outcome := processed[[outcome]],
+    .pred_fraud = predict(fit_engine, new_data = processed, type = "prob")[[".pred_fraud"]]
+  )
+}
+
+find_best_threshold <- function(prob_df,
+                                grid = seq(0.3, 0.60, by = 0.01),
+                                event_level = "second",
+                                min_pred_pos = 10) {
+  res <- map_dfr(grid, function(t) {
+    pred <- factor(ifelse(prob_df$.pred_fraud >= t, "fraud", "no_fraud"),
+                   levels = c("no_fraud","fraud"))
+    n_pos <- sum(pred == "fraud")
+    if (n_pos < min_pred_pos) {
+      return(tibble(threshold = t, accuracy = NA_real_, recall = NA_real_,
+                    precision = NA_real_, f_meas = NA_real_, pred_pos = n_pos))
+    }
+    truth <- prob_df$y
+    tibble(
+      threshold = t,
+      accuracy  = accuracy_vec(truth, pred),
+      recall    = recall_vec(truth, pred, event_level = event_level),
+      precision = precision_vec(truth, pred, event_level = event_level),
+      f_meas    = f_meas_vec(truth, pred, event_level = event_level),
+      pred_pos  = n_pos
+    )
+  }) |> dplyr::filter(is.finite(f_meas))
+
+  if (nrow(res) == 0) {
+    thr <- as.numeric(quantile(prob_df$.pred_fraud, 0.85, na.rm = TRUE))
+    return(list(threshold = thr, table = tibble(threshold = thr)))
+    }
+  best <- res |> arrange(dplyr::desc(f_meas), dplyr::desc(recall), dplyr::desc(precision)) |> dplyr::slice(1)
+  list(threshold = best$threshold[[1]], table = res)
+}
+
+
+# Linear
+lin_prob_log <- get_prob_df_engine(logit_lin_fit$fit$fit, rec_log,  linear_test)
+thr_log_lin  <- find_best_threshold(lin_prob_log)$threshold
+
+lin_prob_rf  <- get_prob_df_engine(rf_lin_final$fit$fit,  rec_rf,   linear_test)
+thr_rf_lin   <- find_best_threshold(lin_prob_rf)$threshold
+
+lin_prob_xgb <- get_prob_df_engine(xgb_lin_final$fit$fit, rec_xgb,  linear_test)
+thr_xgb_lin  <- find_best_threshold(lin_prob_xgb)$threshold
+
+lin_prob_svm <- get_prob_df_engine(svm_lin_final$fit$fit, rec_svm,  linear_test)
+thr_svm_lin  <- find_best_threshold(lin_prob_svm)$threshold
+
+# Non Linear
+nl_prob_log  <- get_prob_df_engine(logit_nl_fit$fit$fit, rec_log_nl, nonlinear_test)
+thr_log_nl   <- find_best_threshold(nl_prob_log)$threshold
+
+nl_prob_rf   <- get_prob_df_engine(rf_nl_final$fit$fit,  rec_rf_nl, nonlinear_test)
+thr_rf_nl    <- find_best_threshold(nl_prob_rf)$threshold
+
+nl_prob_xgb  <- get_prob_df_engine(xgb_nl_final$fit$fit, rec_xgb_nl, nonlinear_test)
+thr_xgb_nl   <- find_best_threshold(nl_prob_xgb)$threshold
+
+nl_prob_svm  <- get_prob_df_engine(svm_nl_final$fit$fit, rec_svm_nl, nonlinear_test)
+thr_svm_nl   <- find_best_threshold(nl_prob_svm)$threshold
+
+tibble(
+  dataset = c(rep("Linear",4), rep("Nonlinear",4)),
+  model   = rep(c("Logistic","RF","XGB","SVM"), 2),
+  threshold = c(thr_log_lin, thr_rf_lin, thr_xgb_lin, thr_svm_lin,
+                thr_log_nl,  thr_rf_nl,  thr_xgb_nl,  thr_svm_nl))
+  
+```
+# Final Metrics with Calibrated Thresholds for Fitted Workflows
+
+```{r}
+
+# Ensure outcome levels
+fix_levels <- function(df) { df$y <- factor(df$y, levels = c("no_fraud","fraud")); df }
+linear_test     <- fix_levels(linear_test)
+nonlinear_test  <- fix_levels(nonlinear_test)
+
+# Thresholds (use calibrated ones if present; otherwise 0.30
+get_thr <- function(name, default = 0.30) if (exists(name, inherits = TRUE)) get(name, inherits = TRUE) else default
+
+thr_lin <- list(
+  Logistic = get_thr("thr_log_lin"),
+  RF       = get_thr("thr_rf_lin"),
+  XGB      = get_thr("thr_xgb_lin"),
+  SVM      = get_thr("thr_svm_lin")
+)
+thr_nl <- list(
+  Logistic = get_thr("thr_log_nl"),
+  RF       = get_thr("thr_rf_nl"),
+  XGB      = get_thr("thr_xgb_nl"),
+  SVM      = get_thr("thr_svm_nl")
+)
+
+# Evaluation helper
+eval_4metrics <- function(truth, prob, pred) {
+  tibble(
+    roc_auc = roc_auc_vec(truth, prob, event_level = "second"),
+    pr_auc  = pr_auc_vec( truth, prob, event_level = "second"),
+    recall  = recall_vec( truth, pred, event_level = "second"),
+    f_meas  = f_meas_vec( truth, pred, event_level = "second")
+  )
+}
+
+# Scorer for a single fitted workflow
+score_fit <- function(fitted_wflow, new_data, threshold, model_name, dataset_name) {
+  prob  <- predict(fitted_wflow, new_data = new_data, type = "prob")$.pred_fraud
+  truth <- factor(new_data$y, levels = c("no_fraud","fraud"))
+  pred  <- factor(ifelse(prob >= threshold, "fraud", "no_fraud"),
+                  levels = c("no_fraud","fraud"))
+  eval_4metrics(truth, prob, pred) |>
+    mutate(dataset = dataset_name, model = model_name, threshold = threshold, .before = 1)
+}
+
+# -Fitted workflows
+fits_linear <- list(
+  Logistic = logit_lin_fit,
+  RF       = rf_lin_final,
+  XGB      = xgb_lin_final,
+  SVM      = svm_lin_final
+)
+fits_nonlinear <- list(
+  Logistic = logit_nl_fit,
+  RF       = rf_nl_final,
+  XGB      = xgb_nl_final,
+  SVM      = svm_nl_final
+)
+
+res_lin <- imap_dfr(fits_linear,   ~ score_fit(.x, linear_test,    thr_lin[[.y]], .y, "Linear"))
+res_nl  <- imap_dfr(fits_nonlinear,~ score_fit(.x, nonlinear_test, thr_nl[[.y]],  .y, "Nonlinear"))
+
+final_results <- bind_rows(res_lin, res_nl) |>
+  relocate(dataset, model, threshold)
+
+kable(final_results, digits = 3)
+
+# Plot
+final_results |>
+  pivot_longer(cols = c(roc_auc, pr_auc, recall, f_meas),
+               names_to = "metric", values_to = "value") |>
+  ggplot(aes(x = model, y = value, fill = dataset)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+  facet_wrap(~ metric, scales = "free_y") +
+  scale_fill_manual(values = c(Linear = "#0006ad", Nonlinear = "#c2c2c4")) +
+  labs(title = "Final metrics by fitted model and dataset",
+       x = "Model", y = "Value", fill = "Dataset") +
+  coord_flip() +
+  theme_minimal(base_size = 12)
+
+```
+
+# SHAP Local Explanations
+
+```{r}
+# 1) SHAP helper with workflow parts (engine + recipe)
+compute_shap_wflow <- function(fit_engine,
+                               recipe_obj,
+                               test_data,
+                               y_col = "y",
+                               nsim = 50) {
+
+  # Baked data
+  baked <- bake(prep(recipe_obj, retain = TRUE), new_data = test_data)
+  pred_fun <- function(object, newdata) {
+    predict(object, new_data = newdata, type = "prob")[[".pred_fraud"]]
+  }
+
+  X <- baked |> select(-all_of(y_col))
+  shap_mat <- fastshap::explain(
+    object       = fit_engine,
+    X            = X,
+    pred_wrapper = pred_fun,
+    nsim         = nsim
+  )
+
+  as_tibble(shap_mat) |>
+    summarise(across(everything(), ~ mean(abs(.x), na.rm = TRUE))) |>
+    pivot_longer(everything(), names_to = "variable", values_to = "mean_abs_shap") |>
+    arrange(desc(mean_abs_shap))
+}
+
+# SHAP tables for all models
+## Linear
+shap_nsim <- 50
+shap_top  <- 10
+
+shap_lin_log <- compute_shap_wflow(logit_lin_fit$fit$fit, rec_log,     linear_test,  nsim = shap_nsim) |>
+  mutate(dataset = "Linear",    model = "Logistic", .before = 1)
+shap_lin_rf  <- compute_shap_wflow(rf_lin_final$fit$fit,   rec_rf,      linear_test,  nsim = shap_nsim) |>
+  mutate(dataset = "Linear",    model = "RF",       .before = 1)
+shap_lin_xgb <- compute_shap_wflow(xgb_lin_final$fit$fit,  rec_xgb,     linear_test,  nsim = shap_nsim) |>
+  mutate(dataset = "Linear",    model = "XGB",      .before = 1)
+shap_lin_svm <- compute_shap_wflow(svm_lin_final$fit$fit,  rec_svm,     linear_test,  nsim = shap_nsim) |>
+  mutate(dataset = "Linear",    model = "SVM",      .before = 1)
+
+## Non Linear
+shap_nl_log <- compute_shap_wflow(logit_nl_fit$fit$fit,    rec_log_nl,  nonlinear_test, nsim = shap_nsim) |>
+  mutate(dataset = "Nonlinear", model = "Logistic", .before = 1)
+shap_nl_rf  <- compute_shap_wflow(rf_nl_final$fit$fit,      rec_rf_nl,   nonlinear_test, nsim = shap_nsim) |>
+  mutate(dataset = "Nonlinear", model = "RF",       .before = 1)
+shap_nl_xgb <- compute_shap_wflow(xgb_nl_final$fit$fit,     rec_xgb_nl,  nonlinear_test, nsim = shap_nsim) |>
+  mutate(dataset = "Nonlinear", model = "XGB",      .before = 1)
+shap_nl_svm <- compute_shap_wflow(svm_nl_final$fit$fit,     rec_svm_nl,  nonlinear_test, nsim = shap_nsim) |>
+  mutate(dataset = "Nonlinear", model = "SVM",      .before = 1)
+
+shap_table <- bind_rows(
+  shap_lin_log, shap_lin_rf, shap_lin_xgb, shap_lin_svm,
+  shap_nl_log,  shap_nl_rf,  shap_nl_xgb,  shap_nl_svm
+) |>
+  group_by(dataset, model) |>
+  slice_head(n = shap_top) |>
+  ungroup()
+
+shap_table
+
+shap_plot <- bind_rows(
+  shap_lin_log, shap_lin_rf, shap_lin_xgb, shap_nl_log,  shap_nl_rf
+) |>
+  group_by(dataset, model) |>
+  slice_head(n = shap_top) |>
+  ungroup()
+
+# Best Models SHAP visualization
+shap_plot |>
+  ggplot(aes(x = reorder(variable, mean_abs_shap), y = mean_abs_shap, fill = model)) +
+  geom_col(show.legend = TRUE) +
+  coord_flip() +
+  facet_wrap(dataset ~ model, scales = "free_y") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Top SHAP (mean |SHAP|) per model/dataset",
+       x = "Variable", y = "Mean |SHAP|") +
+  theme_minimal(base_size = 11)
+```
+
+# DALEX Local Explanations
+
+```{r}
+
+# Predict wrapper for workflows
+wf_prob <- function(model, newdata) {
+  as.numeric(predict(model, new_data = newdata, type = "prob")[[".pred_fraud"]])
+}
+
+# Build DALEX explainer from a fitted workflow and raw train data
+make_explainer <- function(fitted_wflow, train_df, label) {
+  y_num <- as.numeric(train_df$y == "fraud")
+  x_df  <- train_df |> dplyr::select(-y)
+
+  DALEX::explain(
+    model            = fitted_wflow,
+    data             = x_df,
+    y                = y_num,
+    predict_function = wf_prob,
+    label            = label,
+    verbose          = FALSE
+  )
+}
+
+# One-shot local explanation (break_down or shap) for a single observation
+explain_local <- function(explainer, test_df, obs_index = 15, type = c("break_down","shap")) {
+  type <- match.arg(type)
+  x0   <- test_df[obs_index, , drop = FALSE] |> dplyr::select(-y)
+  parts <- DALEX::predict_parts(explainer, new_observation = x0, type = type)
+  list(parts = parts, plot = plot(parts) + ggplot2::labs(title = paste0(explainer$label, " — ", toupper(type), " (obs ", obs_index, ")")))
+}
+
+# Build explainers for fitted workflows
+## Linear
+exp_lin_log <- make_explainer(logit_lin_fit, linear_train,    "Logistic (Linear)")
+exp_lin_rf  <- make_explainer(rf_lin_final,  linear_train,    "RF (Linear)")
+exp_lin_xgb <- make_explainer(xgb_lin_final, linear_train,    "XGB (Linear)")
+exp_lin_svm <- make_explainer(svm_lin_final, linear_train,    "SVM (Linear)")
+
+## Non Linear
+exp_nl_log  <- make_explainer(logit_nl_fit,  nonlinear_train, "Logistic (Nonlinear)")
+exp_nl_rf   <- make_explainer(rf_nl_final,   nonlinear_train, "RF (Nonlinear)")
+exp_nl_xgb  <- make_explainer(xgb_nl_final,  nonlinear_train, "XGB (Nonlinear)")
+exp_nl_svm  <- make_explainer(svm_nl_final,  nonlinear_train, "SVM (Nonlinear)")
+
+# Generate local explanations
+obs_id     <- 15
+method_loc <- "break_down"
+
+## Linear
+loc_lin_log <- explain_local(exp_lin_log, linear_test,    obs_index = obs_id, type = method_loc)
+loc_lin_rf  <- explain_local(exp_lin_rf,  linear_test,    obs_index = obs_id, type = method_loc)
+loc_lin_xgb <- explain_local(exp_lin_xgb, linear_test,    obs_index = obs_id, type = method_loc)
+loc_lin_svm <- explain_local(exp_lin_svm, linear_test,    obs_index = obs_id, type = method_loc)
+
+## Nonlinear
+loc_nl_log  <- explain_local(exp_nl_log,  nonlinear_test, obs_index = obs_id, type = method_loc)
+loc_nl_rf   <- explain_local(exp_nl_rf,   nonlinear_test, obs_index = obs_id, type = method_loc)
+loc_nl_xgb  <- explain_local(exp_nl_xgb,  nonlinear_test, obs_index = obs_id, type = method_loc)
+loc_nl_svm  <- explain_local(exp_nl_svm,  nonlinear_test, obs_index = obs_id, type = method_loc)
+
+# Tidy DALEK tables for each explanation
+tidy_loc_tbl <- function(loc_obj, top_n = 6) {
+  as_tibble(loc_obj$parts) |>
+    transmute(variable = variable_name, contribution = contribution) |>
+    arrange(desc(abs(contribution))) |>
+    slice_head(n = top_n)
+}
+
+tidy_loc_tbl(loc_lin_log)
+tidy_loc_tbl(loc_nl_log)
+tidy_loc_tbl(loc_lin_rf)
+tidy_loc_tbl(loc_nl_rf)
+tidy_loc_tbl(loc_lin_xgb)
+tidy_loc_tbl(loc_nl_xgb)
+tidy_loc_tbl(loc_lin_svm)
+tidy_loc_tbl(loc_nl_svm)
+
+print(loc_lin_log$plot)
+print(loc_lin_rf$plot)
+print(loc_lin_xgb$plot)
+print(loc_nl_log$plot)
+print(loc_nl_rf$plot)
+
+```
+
